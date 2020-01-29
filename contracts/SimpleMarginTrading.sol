@@ -11,6 +11,9 @@ import "@0x/contracts-erc20/contracts/src/interfaces/IERC20Token.sol";
 import "@0x/contracts-exchange/contracts/src/interfaces/IExchange.sol";
 import "@0x/contracts-asset-proxy/contracts/src/interfaces/IAssetData.sol";
 import "@0x/contracts-erc20/contracts/src/interfaces/IEtherToken.sol";
+
+import "@0x/contracts-quote-utils/contracts/src/interfaces/IQuoteUtils.sol";
+
 import "./interfaces/ICERC20.sol";
 import "./interfaces/ICETH.sol";
 import "./interfaces/IComptroller.sol";
@@ -31,20 +34,14 @@ contract SimpleMarginTrading
     IEtherToken internal WETH; // possible to get underlying address of C token from contract?
     IERC20Token internal DAI;
 
+    IQuoteUtils internal QUOTE_UTILS;
+
     // margin position related variables
     uint256 internal positionBalance = 0; // total position size (ETH locked in CETH + WETH + contract balance)
 
-    struct ZeroExQuote {
-        address buyToken;
-        address sellToken;
-        uint256 buyAmount;
-        uint256 sellAmount;
-        uint256 protocolFeeAmount;
-        bytes calldataHex;
-    }
-
     constructor (
         address _exchange,
+        address _quoteUtils,
         address _comptroller,
         address _cdai,
         address _dai,
@@ -55,6 +52,7 @@ contract SimpleMarginTrading
     {
         EXCHANGE = IExchange(_exchange);
         COMPTROLLER = IComptroller(_comptroller);
+        QUOTE_UTILS = IQuoteUtils(_quoteUtils);
         CDAI = ICERC20(_ceth);
         CETH = ICETH(_cdai);
         WETH = IEtherToken(_weth);
@@ -106,14 +104,14 @@ contract SimpleMarginTrading
         LibERC20Token.approve(token, delegated, MAX_UINT);
     }
 
-    
-    function open(ZeroExQuote memory quote)
+    function open(bytes memory calldataHex)
         public
         payable
         onlyOwner
         onlyWhenClosed
         returns (uint256 positionBalance, uint256 wethBalance, uint256 borrowBalance)
     {
+        IQuoteUtils.Quote quote = QUOTE_UTILS.getZeroExQuote(calldataHex);
         // increase position by msg.value - protocolFeeAmount
         positionBalance = msg.value.safeSub(quote.protocolFeeAmount);
         // mint collateral in compound
@@ -123,9 +121,10 @@ contract SimpleMarginTrading
         // swap token for collateral
         _approve(address(DAI), _getZeroExApprovalAddress());
         // verify quote is valid
+        require(quote.sellToken == address(DAI), "not selling DAI");
         require(quote.buyToken == address(WETH), "not buying WETH");
         // execute swap
-        (bool success, bytes memory data) = address(EXCHANGE).call.value(quote.protocolFeeAmount)(quote.calldataHex);
+        (bool success, bytes memory data) = address(EXCHANGE).call.value(quote.protocolFeeAmount)(calldataHex);
         require(success, "Swap not filled.");
         // decode fill results
         LibFillResults.FillResults memory fillResults = abi.decode(data, (LibFillResults.FillResults));
@@ -136,41 +135,42 @@ contract SimpleMarginTrading
         // at this point you have CETH, and swapped for WETH
     }
 
-    function close(
-       ZeroExQuote memory quote
-    )
+    function close(bytes memory calldataHex)
         public
         onlyOwner
         onlyWhenOpen
-        returns (bool)
+        returns (uint256)
     {
         // approve for swap
         _approve(address(WETH), _getZeroExApprovalAddress());
         // verify swap
         uint256 wethBalance = WETH.balanceOf(address(this));
-        uint256 daiBorrowBalance = CDAI.borrowBalanceCurrent(address(this)); // TODO
+        uint256 daiBorrowBalance = CDAI.borrowBalanceCurrent(address(this));
 
-        require(wethBalance < quote.sellAmount, "not enough to swap");
-        require(quote.buyToken == address(DAI), "not buying DAI");
-        require(daiBorrowBalance < quote.buyAmount, "not enough DAI to repay");
+        IQuoteUtils.Quote improvedQuote = QUOTE_UTILS.getZeroExQuoteForBuyAmount(calldataHex, daiBorrowBalance);
+        require(improvedQuote.buyToken == address(WETH), "not selling WETH");
+        require(improvedQuote.buyToken == address(DAI), "not buying DAI");
+        require(wethBalance > improvedQuote.sellAmount, "not enough to swap");
+        require(daiBorrowBalance == improvedQuote.buyAmount, "not enough DAI to repay");
         // execute swap
-        (bool success, bytes memory data) = address(EXCHANGE).call.value(quote.protocolFeeAmount)(quote.calldataHex);
+        (bool success, bytes memory data) = address(EXCHANGE).call.value(quote.protocolFeeAmount)(calldataHex);
         require(success, "Swap not filled.");
         // decode results
         LibFillResults.FillResults memory fillResults = abi.decode(data, (LibFillResults.FillResults));
         // return back DAI
         _approve(address(DAI), address(CDAI));
         // verify sufficient DAI to repay
-        require(CDAI.repayBorrow(fillResults.makerAssetFilledAmount) == 0);
+        require(CDAI.repayBorrow(daiBorrowBalance) == 0);
         // get back ETH
         require(CETH.redeem(CETH.borrowBalanceCurrent(address(this))) == 0); // TODO correct?
         // withdraw all WETH Balance;
         WETH.withdraw(wethBalance);
         // transfer all ETH back to owner;
+        uint256 totalReturnedEth = address(this).balance;
         OWNER.transfer(address(this).balance);
         // reset balance
         wethBalance = 0;
         positionBalance = 0;
-        return false;
+        return totalReturnedEth;
     }
 }
